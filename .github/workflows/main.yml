@@ -23,8 +23,7 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
-      with:
-        ref: master  # التأكد من استخدام فرع master
+      # لا نحدد ref، فيستخدم الفرع الافتراضي (main أو master)
     
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -35,7 +34,6 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y google-chrome-stable xvfb
-        # تأكد من تثبيت chromedriver (سيقوم seleniumbase بإدارته)
     
     - name: Install Python dependencies
       run: |

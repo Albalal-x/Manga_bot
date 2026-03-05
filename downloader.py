@@ -5,7 +5,7 @@ import gc
 import zipfile
 import requests
 from PIL import Image
-from seleniumbase import Driver
+from seleniumbase import SB
 import argparse
 import logging
 from pathlib import Path
@@ -24,7 +24,6 @@ class MangaDownloader:
         self.pdf_dir = self.output_dir / "pdfs"
         self.zip_dir = self.output_dir / "zips"
         self.chapter_urls = []
-        self.driver = None
         
         # إنشاء المجلدات
         self.pdf_dir.mkdir(parents=True, exist_ok=True)
@@ -40,69 +39,65 @@ class MangaDownloader:
             self.chapter_urls.append((chap_num, url))
         logging.info(f"تم تجهيز {len(self.chapter_urls)} رابط فصل")
 
-    def init_driver(self):
-        """بدء تشغيل WebDriver مع تجاوز Cloudflare"""
-        if not self.driver:
-            logging.info("جاري تشغيل WebDriver...")
-            self.driver = Driver(uc=True, headless=True)  # UC=True لتجاوز Cloudflare
-            self.driver.implicitly_wait(10)
-
-    def close_driver(self):
-        """إغلاق WebDriver وتحرير الموارد"""
-        if self.driver:
-            self.driver.quit()
-            self.driver = None
-            logging.info("تم إغلاق WebDriver")
-
     def extract_images_from_page(self, url):
-        """استخراج روابط الصور من صفحة الفصل"""
-        self.init_driver()
-        logging.info(f"فتح الرابط: {url}")
-        self.driver.get(url)
-        
-        # انتظار تحميل الصور - يمكن تخصيص المحدد حسب الموقع
-        # محاولة انتظار وجود عناصر الصور
-        try:
-            self.driver.wait_for_element("img", timeout=15)
-        except:
-            logging.warning("لم يتم العثور على صور بعد 15 ثانية، قد تكون الصفحة مختلفة")
-        
-        # استراتيجيات متعددة للعثور على الصور
-        image_elements = []
-        
-        # المحاولة الأولى: البحث عن الصور داخل منطقة المحتوى (شائعة في مواقع المانجا)
-        selectors = [
-            "div.reader-area img", 
-            "div.chapter-images img",
-            "div.page-break img",
-            "div#all img",
-            "img[data-src]",  # lazy loading
-            "img"
-        ]
-        
-        for selector in selectors:
-            elements = self.driver.find_elements(selector)
-            if elements:
-                image_elements = elements
-                logging.info(f"تم العثور على {len(elements)} صورة باستخدام المحدد: {selector}")
-                break
-        
-        if not image_elements:
-            logging.error("لم يتم العثور على أي صور في الصفحة")
-            return []
-        
-        # استخراج عناوين URL للصور
-        image_urls = []
-        for img in image_elements:
-            # محاولة الحصول على src أو data-src
-            src = img.get_attribute("src") or img.get_attribute("data-src")
-            if src and (src.startswith("http") or src.startswith("//")):
-                if src.startswith("//"):
-                    src = "https:" + src
-                image_urls.append(src)
-        
-        logging.info(f"تم استخراج {len(image_urls)} رابط صورة")
-        return image_urls
+        """استخراج روابط الصور من صفحة الفصل باستخدام SB"""
+        with SB(uc=True, headless=True) as sb:
+            logging.info(f"فتح الرابط: {url}")
+            sb.open(url)
+            
+            # تفعيل وضع cdp للتعامل مع الصفحات الديناميكية
+            sb.activate_cdp_mode(url)
+            
+            # انتظار تحميل الصفحة
+            sb.sleep(3)
+            
+            # محاولة حل أي تحدي (Cloudflare / Turnstile) إذا ظهر
+            try:
+                sb.uc_gui_click_captcha()
+                sb.sleep(2)
+            except:
+                pass  # لا يوجد كابتشا
+            
+            # انتظار ظهور الصور
+            sb.wait_for_element("img", timeout=15)
+            
+            # استراتيجيات متعددة للعثور على الصور
+            image_elements = []
+            selectors = [
+                "div.reader-area img", 
+                "div.chapter-images img",
+                "div.page-break img",
+                "div#all img",
+                "img[data-src]",  # lazy loading
+                "img"
+            ]
+            
+            for selector in selectors:
+                elements = sb.find_elements(selector)
+                if elements:
+                    image_elements = elements
+                    logging.info(f"تم العثور على {len(elements)} صورة باستخدام المحدد: {selector}")
+                    break
+            
+            if not image_elements:
+                logging.error("لم يتم العثور على أي صور في الصفحة")
+                return []
+            
+            # استخراج عناوين URL للصور
+            image_urls = []
+            for img in image_elements:
+                src = img.get_attribute("src") or img.get_attribute("data-src")
+                if src:
+                    if src.startswith("//"):
+                        src = "https:" + src
+                    elif src.startswith("/"):
+                        # بناء الرابط الكامل
+                        base = "/".join(url.split("/")[:3])  # https://domain.com
+                        src = base + src
+                    image_urls.append(src)
+            
+            logging.info(f"تم استخراج {len(image_urls)} رابط صورة")
+            return image_urls
 
     def download_images(self, chapter_num, image_urls):
         """تحميل الصور وإنشاء PDF"""
@@ -206,30 +201,26 @@ class MangaDownloader:
 
     def run(self):
         """تشغيل عملية التحميل"""
-        try:
-            all_pdfs = []
-            for chap_num, url in self.chapter_urls:
-                logging.info(f"بدء معالجة الفصل {chap_num}")
-                
-                # استخراج روابط الصور
-                image_urls = self.extract_images_from_page(url)
-                
-                # تحميل وإنشاء PDF
-                pdf_path = self.download_images(chap_num, image_urls)
-                if pdf_path:
-                    all_pdfs.append(pdf_path)
-                
-                # تنظيف الذاكرة بعد كل فصل
-                gc.collect()
+        all_pdfs = []
+        for chap_num, url in self.chapter_urls:
+            logging.info(f"بدء معالجة الفصل {chap_num}")
             
-            # إنشاء ملفات zip
-            zip_files = self.create_zips()
-            logging.info(f"تم إنشاء {len(zip_files)} ملف zip بنجاح")
+            # استخراج روابط الصور (داخل كل دورة يتم إنشاء SB وإغلاقه تلقائياً)
+            image_urls = self.extract_images_from_page(url)
             
-            return zip_files
+            # تحميل وإنشاء PDF
+            pdf_path = self.download_images(chap_num, image_urls)
+            if pdf_path:
+                all_pdfs.append(pdf_path)
             
-        finally:
-            self.close_driver()
+            # تنظيف الذاكرة بعد كل فصل
+            gc.collect()
+        
+        # إنشاء ملفات zip
+        zip_files = self.create_zips()
+        logging.info(f"تم إنشاء {len(zip_files)} ملف zip بنجاح")
+        
+        return zip_files
 
 def main():
     parser = argparse.ArgumentParser(description='تحميل مانجا من manga-starz.net')

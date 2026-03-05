@@ -11,6 +11,8 @@ import logging
 from pathlib import Path
 import time
 import shutil
+import random
+from bs4 import BeautifulSoup
 
 # إعداد logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -40,8 +42,7 @@ class MangaDownloader:
                 url = self.base_url.replace("{}", str(chap_num))
                 self.chapter_urls.append((chap_num, url))
         else:
-            # حالة الرابط المباشر (بدون {}). نفترض أن الرابط يشير إلى الفصل الأول (start)
-            # نحاول استخراج الجزء الأساسي من الرابط (بدون الرقم في النهاية)
+            # حالة الرابط المباشر (بدون {}). نحاول استخراج الجزء الأساسي من الرابط
             match = re.search(r'^(.*?)(\d+)$', self.base_url)
             if match:
                 base_part = match.group(1)  # الجزء قبل الرقم
@@ -59,64 +60,99 @@ class MangaDownloader:
         logging.debug(f"الروابط: {self.chapter_urls}")
 
     def extract_images_from_page(self, url):
-        """استخراج روابط الصور من صفحة الفصل باستخدام SB"""
-        with SB(uc=True, headless=True) as sb:
+        """استخراج روابط الصور من صفحة الفصل بنفس الطريقة الناجحة مع arabshentai.com"""
+        with SB(uc=True, test=True, locale_code="en") as sb:
             logging.info(f"فتح الرابط: {url}")
-            sb.open(url)
             
-            # تفعيل وضع cdp للتعامل مع الصفحات الديناميكية
+            # تفعيل وضع CDP وفتح الرابط
             sb.activate_cdp_mode(url)
             
             # انتظار تحميل الصفحة
-            sb.sleep(3)
+            logging.info("انتظار تحميل الصفحة...")
+            sb.sleep(random.uniform(3, 5))
             
-            # محاولة حل أي تحدي (Cloudflare / Turnstile) إذا ظهر
+            # محاولة حل Cloudflare / Turnstile captcha
             try:
+                logging.info("محاولة حل الكابتشا...")
                 sb.uc_gui_click_captcha()
                 sb.sleep(2)
-            except:
-                pass  # لا يوجد كابتشا
+            except Exception as e:
+                logging.debug(f"لا يوجد كابتشا أو فشل النقر: {e}")
             
-            # انتظار ظهور الصور
-            sb.wait_for_element("img", timeout=15)
+            # انتظار إضافي بعد حل الكابتشا
+            sb.sleep(random.uniform(2, 4))
             
-            # استراتيجيات متعددة للعثور على الصور
-            image_elements = []
-            selectors = [
-                "div.reader-area img", 
-                "div.chapter-images img",
-                "div.page-break img",
-                "div#all img",
-                "img[data-src]",  # lazy loading
-                "img"
-            ]
-            
-            for selector in selectors:
-                elements = sb.find_elements(selector)
-                if elements:
-                    image_elements = elements
-                    logging.info(f"تم العثور على {len(elements)} صورة باستخدام المحدد: {selector}")
-                    break
-            
-            if not image_elements:
-                logging.error("لم يتم العثور على أي صور في الصفحة")
+            # التأكد من تحميل الصفحة
+            try:
+                sb.assert_element("body", timeout=10)
+                logging.info("تم تأكيد تحميل الصفحة بنجاح")
+            except Exception as e:
+                logging.error(f"فشل تحميل الصفحة: {e}")
                 return []
             
-            # استخراج عناوين URL للصور
+            # تمييز بعض العناصر (لمحاكاة السلوك البشري)
+            try:
+                sb.highlight("a", loops=1)
+            except:
+                pass
+            
+            # التمرير لأسفل لتحميل الصور (إذا كانت lazy loading)
+            for _ in range(3):
+                sb.execute_script("window.scrollBy(0, 400)")
+                sb.sleep(1)
+            
+            # انتظار ظهور الصور
+            sb.sleep(2)
+            
+            # استخراج HTML
+            html = sb.get_page_source()
+            
+            # استخدام BeautifulSoup لاستخراج جميع الصور
+            soup = BeautifulSoup(html, 'lxml')
+            
+            # استخراج جميع عناصر img
+            img_tags = soup.find_all('img')
+            logging.info(f"تم العثور على {len(img_tags)} علامة img في HTML")
+            
             image_urls = []
-            for img in image_elements:
-                src = img.get_attribute("src") or img.get_attribute("data-src")
+            for img in img_tags:
+                # محاولة الحصول على src أو data-src
+                src = img.get('src') or img.get('data-src')
                 if src:
-                    if src.startswith("//"):
-                        src = "https:" + src
-                    elif src.startswith("/"):
-                        # بناء الرابط الكامل
-                        base = "/".join(url.split("/")[:3])  # https://domain.com
+                    # معالجة الروابط النسبية
+                    if src.startswith('//'):
+                        src = 'https:' + src
+                    elif src.startswith('/'):
+                        base = '/'.join(url.split('/')[:3])
                         src = base + src
                     image_urls.append(src)
             
-            logging.info(f"تم استخراج {len(image_urls)} رابط صورة")
-            return image_urls
+            # إزالة التكرارات
+            image_urls = list(dict.fromkeys(image_urls))
+            
+            # تصفية الروابط التي تحتوي على كلمات مفتاحية للإعلانات أو الأيقونات
+            filtered_urls = []
+            for img_url in image_urls:
+                # تجاهل الصور الصغيرة أو الإعلانات
+                if any(keyword in img_url.lower() for keyword in ['logo', 'icon', 'banner', 'ad', 'sponsor']):
+                    continue
+                # الاحتفاظ بالروابط التي تبدو كصور مانجا (غالباً jpg, png, webp)
+                if re.search(r'\.(jpg|jpeg|png|webp|gif)(\?|$)', img_url.lower()):
+                    filtered_urls.append(img_url)
+            
+            if not filtered_urls:
+                logging.warning("لم يتم العثور على صور مانجا، قد يكون هناك خطأ في التصفية")
+                filtered_urls = image_urls  # استخدام الكل كخطة احتياطية
+            
+            logging.info(f"تم استخراج {len(filtered_urls)} رابط صورة بعد التصفية")
+            
+            # إظهار رسالة نجاح
+            try:
+                sb.post_message(f"تم استخراج {len(filtered_urls)} صورة للفصل", duration=2)
+            except:
+                pass
+            
+            return filtered_urls
 
     def download_images(self, chapter_num, image_urls):
         """تحميل الصور وإنشاء PDF"""
@@ -128,14 +164,21 @@ class MangaDownloader:
         chapter_dir.mkdir(exist_ok=True)
         
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Referer': 'https://manga-starz.net/',
+            'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
         }
         
         images = []
         for idx, img_url in enumerate(image_urls, 1):
             try:
                 logging.debug(f"تحميل الصورة {idx}/{len(image_urls)} للفصل {chapter_num}")
-                response = requests.get(img_url, headers=headers, timeout=10)
+                
+                # إضافة تأخير عشوائي بين الطلبات
+                time.sleep(random.uniform(0.5, 1.5))
+                
+                response = requests.get(img_url, headers=headers, timeout=15)
                 response.raise_for_status()
                 
                 img_path = chapter_dir / f"{idx:03d}.jpg"
@@ -224,8 +267,12 @@ class MangaDownloader:
         for chap_num, url in self.chapter_urls:
             logging.info(f"بدء معالجة الفصل {chap_num}")
             
-            # استخراج روابط الصور (داخل كل دورة يتم إنشاء SB وإغلاقه تلقائياً)
+            # استخراج روابط الصور
             image_urls = self.extract_images_from_page(url)
+            
+            if not image_urls:
+                logging.error(f"فشل استخراج الصور للفصل {chap_num}، تخطي...")
+                continue
             
             # تحميل وإنشاء PDF
             pdf_path = self.download_images(chap_num, image_urls)
@@ -234,6 +281,12 @@ class MangaDownloader:
             
             # تنظيف الذاكرة بعد كل فصل
             gc.collect()
+            
+            # تأخير عشوائي بين الفصول
+            if chap_num < self.end:
+                delay = random.uniform(10, 20)
+                logging.info(f"انتظار {delay:.2f} ثانية قبل الفصل التالي...")
+                time.sleep(delay)
         
         # إنشاء ملفات zip
         zip_files = self.create_zips()

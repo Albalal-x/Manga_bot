@@ -1,0 +1,59 @@
+name: Manga Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: 'الرابط الأساسي مع {} للفصل (مثال: https://manga-starz.net/manga/onepiece-chapter-{}/)'
+        required: true
+        type: string
+      start_chapter:
+        description: 'رقم فصل البداية'
+        required: true
+        type: number
+      end_chapter:
+        description: 'رقم فصل النهاية'
+        required: true
+        type: number
+
+jobs:
+  download-manga:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        ref: master  # التأكد من استخدام فرع master
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y google-chrome-stable xvfb
+        # تأكد من تثبيت chromedriver (سيقوم seleniumbase بإدارته)
+    
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Run downloader
+      run: |
+        python downloader.py "${{ github.event.inputs.base_url }}" ${{ github.event.inputs.start_chapter }} ${{ github.event.inputs.end_chapter }}
+    
+    - name: Upload ZIP artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: manga-chapters
+        path: downloads/zips/*.zip
+        retention-days: 2
+    
+    - name: Clean up
+      if: always()
+      run: |
+        rm -rf downloads

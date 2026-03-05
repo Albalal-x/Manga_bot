@@ -33,13 +33,7 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y google-chrome-stable xvfb
-        # تثبيت متطلبات إضافية لعرض الصور
-        sudo apt-get install -y libgl1-mesa-glx libglib2.0-0 libsm6 libxrender1 libxext6
-    
-    - name: Install Python dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
+        # تم إزالة الحزم غير الضرورية التي تسبب الخطأ (libgl1-mesa-glx وغيرها)
     
     - name: Run downloader
       run: |

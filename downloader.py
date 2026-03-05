@@ -13,12 +13,15 @@ import time
 import shutil
 import random
 from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # إعداد logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class MangaDownloader:
-    def __init__(self, base_url, start_chapter, end_chapter, output_dir="downloads"):
+    def __init__(self, base_url, start_chapter, end_chapter, output_dir="downloads", max_workers=5):
         self.base_url = base_url
         self.start = int(start_chapter)
         self.end = int(end_chapter)
@@ -26,10 +29,13 @@ class MangaDownloader:
         self.pdf_dir = self.output_dir / "pdfs"
         self.zip_dir = self.output_dir / "zips"
         self.chapter_urls = []
+        self.max_workers = max_workers  # عدد العمال لتحميل الصور بالتوازي
         
+        # إنشاء المجلدات
         self.pdf_dir.mkdir(parents=True, exist_ok=True)
         self.zip_dir.mkdir(parents=True, exist_ok=True)
         
+        # تجهيز روابط الفصول
         self.prepare_urls()
 
     def prepare_urls(self):
@@ -39,6 +45,7 @@ class MangaDownloader:
                 url = self.base_url.replace("{}", str(chap_num))
                 self.chapter_urls.append((chap_num, url))
         else:
+            # محاولة استخراج الجزء الأساسي من الرابط (بدون الرقم في النهاية)
             match = re.search(r'^(.*?)(\d+)$', self.base_url)
             if match:
                 base_part = match.group(1)
@@ -46,45 +53,47 @@ class MangaDownloader:
                     url = base_part + str(chap_num)
                     self.chapter_urls.append((chap_num, url))
             else:
+                # إذا لم نتمكن من استخراج الرقم، نضيف الرقم إلى نهاية الرابط مع / إذا لزم الأمر
                 base_part = self.base_url.rstrip('/') + '/'
                 for chap_num in range(self.start, self.end + 1):
                     url = base_part + str(chap_num)
                     self.chapter_urls.append((chap_num, url))
+        
         logging.info(f"تم تجهيز {len(self.chapter_urls)} رابط فصل")
 
     def extract_images_from_page(self, sb, url):
         """استخراج روابط الصور من صفحة الفصل باستخدام جلسة المتصفح الحالية sb"""
         logging.info(f"فتح الرابط: {url}")
-        sb.activate_cdp_mode(url)
-        time.sleep(random.uniform(3, 5))
         
+        # استخدام CDP mode لفتح الرابط
+        sb.activate_cdp_mode(url)
+        time.sleep(random.uniform(2, 4))
+        
+        # محاولة حل أي تحدٍ (Cloudflare / Turnstile) إذا ظهر
         try:
             sb.uc_gui_click_captcha()
             time.sleep(2)
         except:
             pass
         
-        sb.sleep(random.uniform(2, 4))
-        
+        # الانتظار حتى تظهر الصفحة
         try:
-            sb.assert_element("body", timeout=10)
+            sb.assert_element("body", timeout=15)
             logging.info("تم تأكيد تحميل الصفحة بنجاح")
         except Exception as e:
             logging.error(f"فشل تحميل الصفحة: {e}")
             return []
         
-        try:
-            sb.highlight("a", loops=1)
-        except:
-            pass
-        
+        # التمرير لأسفل لتحميل الصور (إذا كانت lazy loading)
         for _ in range(3):
             sb.execute_script("window.scrollBy(0, 400)")
-            sb.sleep(1)
+            time.sleep(1)
         
-        sb.sleep(2)
+        # الحصول على HTML وتحليله
         html = sb.get_page_source()
         soup = BeautifulSoup(html, 'lxml')
+        
+        # استخراج جميع علامات img
         img_tags = soup.find_all('img')
         logging.info(f"تم العثور على {len(img_tags)} علامة img في HTML")
         
@@ -92,6 +101,7 @@ class MangaDownloader:
         for img in img_tags:
             src = img.get('src') or img.get('data-src')
             if src:
+                # معالجة الروابط النسبية
                 if src.startswith('//'):
                     src = 'https:' + src
                 elif src.startswith('/'):
@@ -99,29 +109,27 @@ class MangaDownloader:
                     src = base + src
                 image_urls.append(src)
         
+        # إزالة التكرارات
         image_urls = list(dict.fromkeys(image_urls))
         
+        # تصفية الصور غير المرغوب فيها (إعلانات، أيقونات)
         filtered_urls = []
         for img_url in image_urls:
-            if any(keyword in img_url.lower() for keyword in ['logo', 'icon', 'banner', 'ad', 'sponsor']):
+            if any(keyword in img_url.lower() for keyword in ['logo', 'icon', 'banner', 'ad', 'sponsor', 'button']):
                 continue
+            # الاحتفاظ بصور المانجا (jpg, png, webp)
             if re.search(r'\.(jpg|jpeg|png|webp|gif)(\?|$)', img_url.lower()):
                 filtered_urls.append(img_url)
         
         if not filtered_urls:
-            logging.warning("لم يتم العثور على صور مانجا، قد يكون هناك خطأ في التصفية")
+            logging.warning("لم يتم العثور على صور مانجا، قد يكون هناك خطأ في التصفية. استخدام جميع الصور.")
             filtered_urls = image_urls
         
         logging.info(f"تم استخراج {len(filtered_urls)} رابط صورة بعد التصفية")
-        try:
-            sb.post_message(f"تم استخراج {len(filtered_urls)} صورة للفصل", duration=2)
-        except:
-            pass
-        
         return filtered_urls
 
     def download_images(self, sb, chapter_num, image_urls):
-        """تحميل الصور وإنشاء PDF باستخدام جلسة المتصفح sb"""
+        """تحميل الصور وإنشاء PDF باستخدام جلسة requests مع كوكيز مستخرجة مرة واحدة"""
         if not image_urls:
             logging.error(f"لا توجد صور للفصل {chapter_num}")
             return None
@@ -129,76 +137,135 @@ class MangaDownloader:
         chapter_dir = self.pdf_dir / f"chapter_{chapter_num:03d}"
         chapter_dir.mkdir(exist_ok=True)
         
+        # استخراج الكوكيز مرة واحدة فقط في بداية الفصل
+        try:
+            cookies = sb.driver.get_cookies()
+            session = requests.Session()
+            
+            # إعداد استراتيجية إعادة المحاولة للطلبات
+            retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+            session.mount('https://', HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10))
+            session.mount('http://', HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10))
+            
+            for cookie in cookies:
+                session.cookies.set(cookie['name'], cookie['value'])
+            logging.info(f"تم استخراج {len(cookies)} كوكيز من المتصفح للفصل {chapter_num}")
+        except Exception as e:
+            logging.error(f"فشل استخراج الكوكيز للفصل {chapter_num}: {e}. سيتم المحاولة بدون كوكيز.")
+            session = requests.Session()
+        
+        # إعداد headers ثابتة
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Referer': 'https://manga-starz.net/',
+            'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
+            'Connection': 'keep-alive',
+        }
+        session.headers.update(headers)
+        
+        # تحميل الصور باستخدام ThreadPoolExecutor لزيادة السرعة
         images = []
-        # استخراج الكوكيز من جلسة المتصفح لاستخدامها مع requests (اختياري، لكن الأفضل التحميل عبر المتصفح)
-        # ولكن سنستخدم المتصفح للتحميل لضمان النجاح.
-        for idx, img_url in enumerate(image_urls, 1):
+        successful_images = 0
+        
+        def download_single_image(img_url, idx):
+            """دالة مساعدة لتحميل صورة واحدة"""
             try:
-                logging.debug(f"تحميل الصورة {idx}/{len(image_urls)} للفصل {chapter_num}")
-                time.sleep(random.uniform(0.5, 1.5))
+                # تأخير عشوائي لتجنب اكتشاف النمط الآلي
+                time.sleep(random.uniform(0.3, 0.8))
                 
-                # استخدام المتصفح لتحميل الصورة
-                # نفتح الصورة في تبويب جديد أو في نفس التبويب ثم نحفظ المحتوى
-                # الطريقة: نستخدم execute_script لإنشاء طلب fetch أو ببساطة نزور الرابط ونسحب المحتوى
-                # الأسهل: نستخدم sb.driver.get(img_url) ثم نأخذ محتوى الصفحة (لكن قد لا يكون عملياً)
-                # الحل: استخدام جلسة requests مع الكوكيز المستخرجة من المتصفح
-                
-                # استخراج الكوكيز من المتصفح
-                cookies = sb.driver.get_cookies()
-                session = requests.Session()
-                for cookie in cookies:
-                    session.cookies.set(cookie['name'], cookie['value'])
-                
-                headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Referer': 'https://manga-starz.net/',
-                    'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-                    'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
-                }
-                
-                response = session.get(img_url, headers=headers, timeout=15)
+                response = session.get(img_url, timeout=15)
                 response.raise_for_status()
                 
-                img_path = chapter_dir / f"{idx:03d}.jpg"
+                # تحديد امتداد الملف بناءً على Content-Type أو الرابط
+                content_type = response.headers.get('content-type', '')
+                if 'jpeg' in content_type or 'jpg' in content_type:
+                    ext = '.jpg'
+                elif 'png' in content_type:
+                    ext = '.png'
+                elif 'webp' in content_type:
+                    ext = '.webp'
+                elif 'gif' in content_type:
+                    ext = '.gif'
+                else:
+                    # استخراج الامتداد من الرابط
+                    match = re.search(r'\.(jpg|jpeg|png|webp|gif)', img_url.lower())
+                    ext = match.group(0) if match else '.jpg'
+                
+                img_path = chapter_dir / f"{idx:03d}{ext}"
                 with open(img_path, 'wb') as f:
                     f.write(response.content)
                 
+                # التحقق من صحة الصورة
                 img = Image.open(img_path)
-                images.append(img_path)
+                img.verify()  # يرفع استثناء إذا كانت الصورة تالفة
                 
-                del response
-                
+                return (idx, img_path)
             except Exception as e:
                 logging.error(f"فشل تحميل الصورة {img_url}: {e}")
-                continue
+                return (idx, None)
         
-        if not images:
+        # استخدام ThreadPoolExecutor لتحميل الصور بالتوازي
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_idx = {executor.submit(download_single_image, url, i+1): i+1 
+                             for i, url in enumerate(image_urls)}
+            
+            for future in as_completed(future_to_idx):
+                idx, img_path = future.result()
+                if img_path:
+                    images.append((idx, img_path))
+                    successful_images += 1
+        
+        # ترتيب الصور حسب الرقم
+        images.sort(key=lambda x: x[0])
+        image_paths = [img_path for _, img_path in images]
+        
+        if not image_paths:
             logging.error(f"لم يتم تحميل أي صور للفصل {chapter_num}")
             return None
         
+        logging.info(f"تم تحميل {len(image_paths)} صورة بنجاح للفصل {chapter_num}")
+        
+        # إنشاء PDF
         pdf_path = self.pdf_dir / f"chapter_{chapter_num:03d}.pdf"
-        self.images_to_pdf(images, pdf_path)
+        self.images_to_pdf(image_paths, pdf_path)
+        
+        # حذف مجلد الصور بعد إنشاء PDF
         shutil.rmtree(chapter_dir)
         logging.info(f"تم إنشاء PDF للفصل {chapter_num}: {pdf_path}")
         
-        del images
+        # تنظيف الذاكرة
+        del images, image_paths
         gc.collect()
+        
         return pdf_path
 
     def images_to_pdf(self, image_paths, output_pdf):
         """تحويل قائمة الصور إلى ملف PDF واحد"""
         image_list = []
         for img_path in image_paths:
-            img = Image.open(img_path)
-            if img.mode != 'RGB':
-                img = img.convert('RGB')
-            image_list.append(img)
+            try:
+                img = Image.open(img_path)
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                image_list.append(img)
+            except Exception as e:
+                logging.error(f"خطأ في فتح الصورة {img_path}: {e}")
+                continue
         
-        if image_list:
+        if not image_list:
+            logging.error("لا توجد صور صالحة لإنشاء PDF")
+            return
+        
+        # حفظ كـ PDF
+        try:
             image_list[0].save(output_pdf, save_all=True, append_images=image_list[1:])
-        
-        for img in image_list:
-            img.close()
+        except Exception as e:
+            logging.error(f"فشل إنشاء PDF: {e}")
+        finally:
+            # إغلاق الصور
+            for img in image_list:
+                img.close()
 
     def create_zips(self):
         """تجميع ملفات PDF في zip كل 10 فصول"""
@@ -210,6 +277,7 @@ class MangaDownloader:
         zip_files = []
         for i in range(0, len(pdf_files), 10):
             batch = pdf_files[i:i+10]
+            # استخراج أرقام الفصول من أسماء الملفات
             first_chap = int(re.search(r'chapter_(\d+)', batch[0].stem).group(1))
             last_chap = int(re.search(r'chapter_(\d+)', batch[-1].stem).group(1))
             zip_name = self.zip_dir / f"chapters_{first_chap:03d}_to_{last_chap:03d}.zip"
@@ -221,6 +289,7 @@ class MangaDownloader:
             logging.info(f"تم إنشاء {zip_name}")
             zip_files.append(zip_name)
         
+        # حذف ملفات PDF بعد الضغط
         for pdf in pdf_files:
             pdf.unlink()
         
@@ -249,8 +318,9 @@ class MangaDownloader:
                 
                 gc.collect()
                 
+                # تأخير عشوائي بين الفصول لتجنب اكتشاف النمط الآلي
                 if chap_num < self.end:
-                    delay = random.uniform(10, 20)
+                    delay = random.uniform(15, 25)
                     logging.info(f"انتظار {delay:.2f} ثانية قبل الفصل التالي...")
                     time.sleep(delay)
         
@@ -264,13 +334,14 @@ def main():
     parser.add_argument('base_url', help='الرابط الأساسي مع أو بدون {} للفصل')
     parser.add_argument('start', type=int, help='رقم فصل البداية')
     parser.add_argument('end', type=int, help='رقم فصل النهاية')
+    parser.add_argument('--workers', type=int, default=5, help='عدد العمال لتحميل الصور بالتوازي (افتراضي 5)')
     
     args = parser.parse_args()
     
     if "{}" not in args.base_url:
         logging.warning("الرابط لا يحتوي على {}، سيتم افتراض أن الرابط هو للفصل الأول وإضافة الأرقام إلى نهايته.")
     
-    downloader = MangaDownloader(args.base_url, args.start, args.end)
+    downloader = MangaDownloader(args.base_url, args.start, args.end, max_workers=args.workers)
     downloader.run()
 
 if __name__ == "__main__":

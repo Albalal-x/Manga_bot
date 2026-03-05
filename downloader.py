@@ -29,15 +29,34 @@ class MangaDownloader:
         self.pdf_dir.mkdir(parents=True, exist_ok=True)
         self.zip_dir.mkdir(parents=True, exist_ok=True)
         
-        # تجهيز روابط الفصول بافتراض وجود placeholder {} في الرابط
+        # تجهيز روابط الفصول
         self.prepare_urls()
 
     def prepare_urls(self):
         """توليد روابط الفصول بناءً على الرابط الأساسي والمدى"""
-        for chap_num in range(self.start, self.end + 1):
-            url = self.base_url.replace("{}", str(chap_num))
-            self.chapter_urls.append((chap_num, url))
+        if "{}" in self.base_url:
+            # حالة وجود placeholder
+            for chap_num in range(self.start, self.end + 1):
+                url = self.base_url.replace("{}", str(chap_num))
+                self.chapter_urls.append((chap_num, url))
+        else:
+            # حالة الرابط المباشر (بدون {}). نفترض أن الرابط يشير إلى الفصل الأول (start)
+            # نحاول استخراج الجزء الأساسي من الرابط (بدون الرقم في النهاية)
+            match = re.search(r'^(.*?)(\d+)$', self.base_url)
+            if match:
+                base_part = match.group(1)  # الجزء قبل الرقم
+                for chap_num in range(self.start, self.end + 1):
+                    url = base_part + str(chap_num)
+                    self.chapter_urls.append((chap_num, url))
+            else:
+                # إذا لم نتمكن من استخراج الرقم، نضيف الرقم إلى نهاية الرابط مع / إذا لزم الأمر
+                base_part = self.base_url.rstrip('/') + '/'
+                for chap_num in range(self.start, self.end + 1):
+                    url = base_part + str(chap_num)
+                    self.chapter_urls.append((chap_num, url))
+        
         logging.info(f"تم تجهيز {len(self.chapter_urls)} رابط فصل")
+        logging.debug(f"الروابط: {self.chapter_urls}")
 
     def extract_images_from_page(self, url):
         """استخراج روابط الصور من صفحة الفصل باستخدام SB"""
@@ -224,15 +243,14 @@ class MangaDownloader:
 
 def main():
     parser = argparse.ArgumentParser(description='تحميل مانجا من manga-starz.net')
-    parser.add_argument('base_url', help='الرابط الأساسي مع placeholder {} للفصل (مثال: https://manga-starz.net/manga/onepiece-chapter-{}/)')
+    parser.add_argument('base_url', help='الرابط الأساسي. إذا كان يحتوي على {} سيتم استبداله برقم الفصل، وإلا سيتم إضافة رقم الفصل إلى نهاية الرابط.')
     parser.add_argument('start', type=int, help='رقم فصل البداية')
     parser.add_argument('end', type=int, help='رقم فصل النهاية')
     
     args = parser.parse_args()
     
     if "{}" not in args.base_url:
-        logging.error("الرابط يجب أن يحتوي على {} كمكان لرقم الفصل")
-        sys.exit(1)
+        logging.warning("الرابط لا يحتوي على {}، سيتم افتراض أن الرابط هو للفصل الأول وإضافة الأرقام إلى نهايته.")
     
     downloader = MangaDownloader(args.base_url, args.start, args.end)
     downloader.run()
